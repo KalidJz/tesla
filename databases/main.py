@@ -187,6 +187,7 @@ class CommandRequest(BaseModel):
     robot_id: str = "ESP32-ROBOT-01"
     comando: str
     modo: str  # "manual", "linea", "automatico"
+    velocidad: Optional[int] = None  # 0 a 100 (%)
     lat: Optional[float] = None
     lng: Optional[float] = None
 
@@ -264,6 +265,8 @@ def send_command(cmd: CommandRequest):
         "modo": cmd.modo,
         "comando": cmd.comando,
     }
+    if cmd.velocidad is not None:
+        payload_dict["velocidad"] = max(0, min(100, cmd.velocidad))
     if cmd.lat is not None and cmd.lng is not None:
         payload_dict["lat"] = cmd.lat
         payload_dict["lng"] = cmd.lng
