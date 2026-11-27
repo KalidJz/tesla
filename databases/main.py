@@ -203,6 +203,31 @@ def get_telemetry():
     """Devuelve la última lectura recibida por MQTT desde el Gateway"""
     return latest_telemetry
 
+@app.get("/api/robot/history")
+def get_history(limit: int = 50):
+    """Devuelve los últimos registros almacenados en la tabla mediciones"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, robot_id, temperatura, humedad, presion, distancia, modo, timestamp
+                FROM mediciones
+                ORDER BY timestamp DESC
+                LIMIT %s;
+                """,
+                (min(limit, 200),)
+            )
+            rows = cursor.fetchall()
+            for r in rows:
+                if r.get("timestamp"):
+                    r["timestamp"] = r["timestamp"].isoformat()
+        return {"count": len(rows), "data": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 @app.post("/api/register", status_code=201)
 def register(user: RegisterRequest):
     conn = get_db()

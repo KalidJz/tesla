@@ -758,52 +758,83 @@ class _GestionScreenState extends State<GestionScreen>
   }
 
   Widget _buildEmergencyStopButton() {
-    return GestureDetector(
-      onTapDown: (_) => setState(() => _stopPressed = true),
-      onTapUp: (_) {
-        setState(() => _stopPressed = false);
-        _emergencyStop();
-      },
-      onTapCancel: () => setState(() => _stopPressed = false),
-      child: AnimatedScale(
-        scale: _stopPressed ? 0.965 : 1.0,
-        duration: const Duration(milliseconds: 100),
-        child: Container(
-          width: double.infinity,
-          height: 54,
-          decoration: BoxDecoration(
+  return Row(
+    children: [
+      // Botón de Claxon
+      SizedBox(
+        width: 60,
+        height: 54,
+        child: Material(
+          color: AppColors.warning.withAlpha(32),
+          borderRadius: BorderRadius.circular(16),
+          child: InkWell(
             borderRadius: BorderRadius.circular(16),
-            gradient: const LinearGradient(
-              colors: [AppColors.danger, Color(0xFFDC2626)],
+            onTap: _tocarClaxon,
+            child: Container(
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: AppColors.warning.withAlpha(140)),
+              ),
+              child: const Icon(
+                Icons.campaign_rounded,
+                color: AppColors.warning,
+                size: 26,
+              ),
             ),
-            boxShadow: [
-              BoxShadow(
-                color: AppColors.danger.withAlpha(_stopPressed ? 35 : 85),
-                blurRadius: _stopPressed ? 8 : 20,
-                offset: const Offset(0, 6),
-              ),
-            ],
-          ),
-          child: const Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(Icons.stop_circle_outlined, color: AppColors.bg, size: 24),
-              SizedBox(width: 10),
-              Text(
-                'STOP DE EMERGENCIA',
-                style: TextStyle(
-                  color: AppColors.bg,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 1.2,
-                ),
-              ),
-            ],
           ),
         ),
       ),
-    );
-  }
+      const SizedBox(width: 12),
+      // Botón de Stop de Emergencia
+      Expanded(
+        child: GestureDetector(
+          onTapDown: (_) => setState(() => _stopPressed = true),
+          onTapUp: (_) {
+            setState(() => _stopPressed = false);
+            _emergencyStop();
+          },
+          onTapCancel: () => setState(() => _stopPressed = false),
+          child: AnimatedScale(
+            scale: _stopPressed ? 0.965 : 1.0,
+            duration: const Duration(milliseconds: 100),
+            child: Container(
+              height: 54,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                gradient: const LinearGradient(
+                  colors: [AppColors.danger, Color(0xFFDC2626)],
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: AppColors.danger.withAlpha(_stopPressed ? 35 : 85),
+                    blurRadius: _stopPressed ? 8 : 20,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.stop_circle_outlined, color: AppColors.bg, size: 24),
+                  SizedBox(width: 10),
+                  Text(
+                    'STOP',
+                    style: TextStyle(
+                      color: AppColors.bg,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    ],
+  );
+}
 
   Widget _arrow(IconData icon, String cmd) {
     final active = _currentCommand == cmd;
@@ -836,6 +867,24 @@ class _GestionScreenState extends State<GestionScreen>
       ),
     );
   }
+
+  Future<void> _tocarClaxon() async {
+  HapticFeedback.mediumImpact();
+  try {
+    if (_mqttClient.connectionStatus?.state != MqttConnectionState.connected) {
+      await _mqttClient.connect();
+    }
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(jsonEncode({'comando': 'claxon'}));
+    _mqttClient.publishMessage(
+      _topicCmd,
+      MqttQos.atMostOnce,
+      builder.payload!,
+    );
+  } catch (e) {
+    debugPrint('Error enviando claxon: $e');
+  }
+}
 
   Widget _directionPad() {
     final bool isMoving = _currentCommand != 'detener';
