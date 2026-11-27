@@ -16,6 +16,7 @@ dependencies:
   fl_chart: ^0.66.0
   file_picker: ^8.0.0
   flutter_joystick: 0.2.2
+  mqtt_client: ^10.14.0
 
 dev_dependencies:
   flutter_test:

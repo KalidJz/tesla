@@ -4,8 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart' hide Path;
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
 import '../app_theme.dart';
 
 class GestionScreen extends StatefulWidget {
@@ -17,8 +18,18 @@ class GestionScreen extends StatefulWidget {
 
 class _GestionScreenState extends State<GestionScreen>
     with TickerProviderStateMixin {
+  // ── Configuración MQTT directa (baja latencia) ──
+  static const String _mqttBroker = 'broker.hivemq.com';
+  static const int _mqttPort = 1883;
+  static const String _topicCmd = 'ucol/entornos/rover/comandos';
+
+  late final MqttServerClient _mqttClient;
+  bool _mqttConnected = false;
+
+  // ── Estado del Rover ──
   String _currentCommand = 'detener';
   String _activeMode = 'manual'; // 'manual', 'linea', 'automatico'
+  double _speed = 80; // Velocidad en porcentaje (30 a 100)
   bool _isSendingRoute = false;
   bool _stopPressed = false;
   LatLng? _targetLocation;
@@ -27,7 +38,6 @@ class _GestionScreenState extends State<GestionScreen>
   final LatLng _initialLocation = const LatLng(19.2499, -103.6977);
   final MapController _mapController = MapController();
 
-  final String apiUrl = 'https://tesla-api-9n4d.onrender.com/api/robot/command';
   DateTime _lastRequestTime = DateTime.now();
 
   late final AnimationController _pulse = AnimationController(
@@ -41,23 +51,60 @@ class _GestionScreenState extends State<GestionScreen>
   )..repeat();
 
   @override
+  void initState() {
+    super.initState();
+    _initMqtt();
+  }
+
+  Future<void> _initMqtt() async {
+    final clientId = 'FlutterRover-${DateTime.now().millisecondsSinceEpoch}';
+    _mqttClient = MqttServerClient.withPort(_mqttBroker, clientId, _mqttPort)
+      ..keepAlivePeriod = 20
+      ..autoReconnect = true
+      ..logging(on: false);
+
+    _mqttClient.onConnected = () {
+      if (mounted) setState(() => _mqttConnected = true);
+    };
+    _mqttClient.onDisconnected = () {
+      if (mounted) setState(() => _mqttConnected = false);
+    };
+
+    try {
+      await _mqttClient.connect();
+    } catch (e) {
+      debugPrint('Error conectando a MQTT: $e');
+      _mqttClient.disconnect();
+    }
+  }
+
+  @override
   void dispose() {
+    _mqttClient.disconnect();
     _pulse.dispose();
     _radar.dispose();
     _mapController.dispose();
     super.dispose();
   }
 
-  Future<void> _sendCommand(String comando, {String? modo}) async {
+  Future<void> _sendCommand(
+    String comando, {
+    String? modo,
+    bool force = false,
+  }) async {
     final targetMode = modo ?? _activeMode;
-    if (comando == _currentCommand && targetMode == 'manual' && modo == null) {
+    if (!force &&
+        comando == _currentCommand &&
+        targetMode == 'manual' &&
+        modo == null) {
       return;
     }
 
     final now = DateTime.now();
-    if (comando != 'detener' &&
+    if (!force &&
+        comando != 'detener' &&
         targetMode == 'manual' &&
-        now.difference(_lastRequestTime).inMilliseconds < 120) {
+        now.difference(_lastRequestTime).inMilliseconds < 100) {
       return;
     }
 
@@ -78,9 +125,9 @@ class _GestionScreenState extends State<GestionScreen>
     _lastRequestTime = now;
 
     final Map<String, dynamic> payload = {
-      'robot_id': 'ESP32-ROBOT-01',
-      'comando': comando,
       'modo': targetMode,
+      'comando': comando,
+      'velocidad': _speed.round(),
     };
 
     if (targetMode == 'automatico' && _targetLocation != null) {
@@ -89,10 +136,17 @@ class _GestionScreenState extends State<GestionScreen>
     }
 
     try {
-      await http.post(
-        Uri.parse(apiUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(payload),
+      if (_mqttClient.connectionStatus?.state != MqttConnectionState.connected) {
+        await _mqttClient.connect();
+      }
+
+      final builder = MqttClientPayloadBuilder();
+      builder.addString(jsonEncode(payload));
+
+      _mqttClient.publishMessage(
+        _topicCmd,
+        MqttQos.atMostOnce,
+        builder.payload!,
       );
 
       if (targetMode == 'automatico' && mounted) {
@@ -120,12 +174,12 @@ class _GestionScreenState extends State<GestionScreen>
         );
       }
     } catch (e) {
-      debugPrint('Error enviando comando: $e');
+      debugPrint('Error publicando en MQTT: $e');
       if (targetMode == 'automatico' && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: const Text(
-              'Error al enviar la ruta',
+              'Error al enviar la ruta por MQTT',
               style:
                   TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
             ),
@@ -155,9 +209,9 @@ class _GestionScreenState extends State<GestionScreen>
     });
 
     if (newMode == 'linea') {
-      _sendCommand('seguir', modo: 'linea');
+      _sendCommand('seguir', modo: 'linea', force: true);
     } else if (newMode == 'manual') {
-      _sendCommand('detener', modo: 'manual');
+      _sendCommand('detener', modo: 'manual', force: true);
     }
   }
 
@@ -167,7 +221,7 @@ class _GestionScreenState extends State<GestionScreen>
       _activeMode = 'manual';
       _currentCommand = 'detener';
     });
-    _sendCommand('detener', modo: 'manual');
+    _sendCommand('detener', modo: 'manual', force: true);
   }
 
   void _onJoystickChanged(StickDragDetails details) {
@@ -227,6 +281,18 @@ class _GestionScreenState extends State<GestionScreen>
     }
   }
 
+  Color get _speedColor {
+    if (_speed < 55) return AppColors.accent;
+    if (_speed < 85) return AppColors.warning;
+    return AppColors.danger;
+  }
+
+  String get _speedLabel {
+    if (_speed < 55) return 'BAJA';
+    if (_speed < 85) return 'MEDIA';
+    return 'TURBO';
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -256,11 +322,14 @@ class _GestionScreenState extends State<GestionScreen>
             ),
           ],
         ),
-        actions: const [
+        actions: [
           Padding(
-            padding: EdgeInsets.only(right: 16),
+            padding: const EdgeInsets.only(right: 16),
             child: Center(
-              child: StatusPill(label: 'En línea', color: AppColors.success),
+              child: StatusPill(
+                label: _mqttConnected ? 'MQTT OK' : 'Conectando',
+                color: _mqttConnected ? AppColors.success : AppColors.warning,
+              ),
             ),
           ),
         ],
@@ -489,13 +558,13 @@ class _GestionScreenState extends State<GestionScreen>
             animation: _pulse,
             builder: (_, __) {
               return SizedBox(
-                width: 268,
-                height: 268,
+                width: 232,
+                height: 232,
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
                     CustomPaint(
-                      size: const Size(268, 268),
+                      size: const Size(232, 232),
                       painter: _RadarRingPainter(
                         color: _commandColor,
                         pulse: _pulse.value,
@@ -504,7 +573,7 @@ class _GestionScreenState extends State<GestionScreen>
                     ),
                     AnimatedContainer(
                       duration: const Duration(milliseconds: 180),
-                      padding: const EdgeInsets.all(14),
+                      padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
                         color: AppColors.surfaceHigh,
@@ -517,7 +586,7 @@ class _GestionScreenState extends State<GestionScreen>
                         boxShadow: [
                           BoxShadow(
                             color: _commandColor.withAlpha(isMoving ? 55 : 18),
-                            blurRadius: isMoving ? 36 : 24,
+                            blurRadius: isMoving ? 32 : 20,
                             spreadRadius: isMoving ? 4 : 0,
                           ),
                         ],
@@ -535,7 +604,80 @@ class _GestionScreenState extends State<GestionScreen>
             },
           ),
           const Spacer(),
+          _buildSpeedControl(),
+          const SizedBox(height: 12),
           _buildEmergencyStopButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSpeedControl() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 6),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppColors.border.withAlpha(170)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.speed_rounded, color: _speedColor, size: 18),
+              const SizedBox(width: 8),
+              const Text(
+                'VELOCIDAD',
+                style: TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.3,
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: _speedColor.withAlpha(28),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: _speedColor.withAlpha(100)),
+                ),
+                child: Text(
+                  '$_speedLabel · ${_speed.round()}%',
+                  style: TextStyle(
+                    color: _speedColor,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 5,
+              activeTrackColor: _speedColor,
+              inactiveTrackColor: AppColors.border.withAlpha(140),
+              thumbColor: Colors.white,
+              overlayColor: _speedColor.withAlpha(45),
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+            ),
+            child: Slider(
+              value: _speed,
+              min: 30,
+              max: 100,
+              divisions: 14, // Saltos de 5% en 5%
+              onChanged: (value) {
+                setState(() => _speed = value);
+              },
+              onChangeEnd: (_) {
+                HapticFeedback.selectionClick();
+                _sendCommand(_currentCommand, modo: _activeMode, force: true);
+              },
+            ),
+          ),
         ],
       ),
     );
@@ -607,6 +749,8 @@ class _GestionScreenState extends State<GestionScreen>
             ),
           ),
           const Spacer(),
+          _buildSpeedControl(),
+          const SizedBox(height: 12),
           _buildEmergencyStopButton(),
         ],
       ),
@@ -939,7 +1083,11 @@ class _GestionScreenState extends State<GestionScreen>
                 child: FilledButton.icon(
                   onPressed: (_targetLocation == null || _isSendingRoute)
                       ? null
-                      : () => _sendCommand('ir_coordenada', modo: 'automatico'),
+                      : () => _sendCommand(
+                            'ir_coordenada',
+                            modo: 'automatico',
+                            force: true,
+                          ),
                   icon: _isSendingRoute
                       ? const SizedBox(
                           width: 18,
@@ -1005,7 +1153,7 @@ class _RadarRingPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = AppColors.border.withAlpha(70);
-    canvas.drawCircle(center, maxR - 20, innerPaint);
+    canvas.drawCircle(center, maxR - 18, innerPaint);
 
     final tickPaint = Paint()
       ..strokeWidth = 2.2
