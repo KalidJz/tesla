@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +22,6 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    """Crea las tablas automáticamente si la base de datos está vacía."""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -40,10 +40,18 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     robot_id VARCHAR(100) NOT NULL,
                     temperatura DOUBLE PRECISION,
+                    humedad DOUBLE PRECISION,
                     presion DOUBLE PRECISION,
+                    distancia DOUBLE PRECISION,
+                    modo VARCHAR(30),
                     timestamp TIMESTAMP DEFAULT NOW()
                 );
             """)
+            # Agrega columnas nuevas si la tabla ya existía en Render
+            cursor.execute("ALTER TABLE mediciones ADD COLUMN IF NOT EXISTS humedad DOUBLE PRECISION;")
+            cursor.execute("ALTER TABLE mediciones ADD COLUMN IF NOT EXISTS distancia DOUBLE PRECISION;")
+            cursor.execute("ALTER TABLE mediciones ADD COLUMN IF NOT EXISTS modo VARCHAR(30);")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS robot_status (
                     robot_id VARCHAR(100) PRIMARY KEY,
@@ -53,55 +61,73 @@ def init_db():
                 );
             """)
         conn.commit()
-        print("[DB] Tablas verificadas/creadas correctamente.")
+        print("[DB] Tablas verificadas correctamente.")
     except Exception as e:
         print(f"[DB] Error inicializando tablas: {e}")
     finally:
         conn.close()
 
-def to_json(row: dict) -> dict:
-    if row is None:
-        return None
-    out = {}
-    for k, v in row.items():
-        if isinstance(v, datetime):
-            out[k] = v.isoformat()
-        elif hasattr(v, "as_tuple"):
-            out[k] = float(v)
-        else:
-            out[k] = v
-    return out
-
 # ============================================================================
-# GESTOR MQTT (CLIENTE Y CALLBACKS DEL GATEWAY)
+# GESTOR MQTT (NUEVOS TÓPICOS DEL GATEWAY)
 # ============================================================================
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
+TOPIC_TEL = "ucol/entornos/rover/telemetria"
+TOPIC_CMD = "ucol/entornos/rover/comandos"
+
+# Caché en memoria con la última telemetría recibida
+latest_telemetry = {
+    "online": False,
+    "t": 0.0,
+    "h": 0.0,
+    "p": 0.0,
+    "d": -1,
+    "lat": 0.0,
+    "lng": 0.0,
+    "m": "manual",
+    "updated_at": None,
+}
 
 def on_connect(client, userdata, flags, rc):
     print(f"[MQTT] Conectado al Broker con código: {rc}")
-    client.subscribe("robot/+/telemetry")
-    client.subscribe("robot/+/gps")
+    client.subscribe(TOPIC_TEL)
 
 def on_message(client, userdata, msg):
-    topic = msg.topic
     raw_payload = msg.payload.decode("utf-8", errors="ignore").strip()
-
     try:
         data = json.loads(raw_payload)
-        robot_id = topic.split("/")[1]
+        robot_id = "ESP32-ROBOT-01"
+
+        t = float(data.get("t", 0.0))
+        h = float(data.get("h", 0.0))
+        p = float(data.get("p", 0.0))
+        d = float(data.get("d", -1))
+        lat = float(data.get("lat", 0.0))
+        lng = float(data.get("lng", 0.0))
+        modo = str(data.get("m", "manual"))
+
+        latest_telemetry.update({
+            "online": True,
+            "t": t,
+            "h": h,
+            "p": p,
+            "d": d,
+            "lat": lat,
+            "lng": lng,
+            "m": modo,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
 
         conn = get_db()
         with conn.cursor() as cursor:
-            if "telemetry" in topic:
-                cursor.execute(
-                    """
-                    INSERT INTO mediciones (robot_id, temperatura, presion, timestamp)
-                    VALUES (%s, %s, %s, NOW());
-                    """,
-                    (robot_id, float(data.get("temperatura", 0)), float(data.get("presion", 0)))
-                )
-            elif "gps" in topic:
+            cursor.execute(
+                """
+                INSERT INTO mediciones (robot_id, temperatura, humedad, presion, distancia, modo, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW());
+                """,
+                (robot_id, t, h, p, d, modo)
+            )
+            if lat != 0.0 or lng != 0.0:
                 cursor.execute(
                     """
                     INSERT INTO robot_status (robot_id, latitud, longitud, ultima_conexion)
@@ -111,7 +137,7 @@ def on_message(client, userdata, msg):
                         longitud = EXCLUDED.longitud,
                         ultima_conexion = NOW();
                     """,
-                    (robot_id, float(data.get("lat", 0)), float(data.get("lng", 0)))
+                    (robot_id, lat, lng)
                 )
         conn.commit()
         conn.close()
@@ -158,9 +184,11 @@ class LoginRequest(BaseModel):
     password: str
 
 class CommandRequest(BaseModel):
-    robot_id: str
+    robot_id: str = "ESP32-ROBOT-01"
     comando: str
-    modo: str
+    modo: str  # "manual", "linea", "automatico"
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
 # ============================================================================
 # ENDPOINTS REST
@@ -168,6 +196,11 @@ class CommandRequest(BaseModel):
 @app.get("/")
 def health_check():
     return {"status": "online", "service": "Robot Control API"}
+
+@app.get("/api/robot/telemetry")
+def get_telemetry():
+    """Devuelve la última lectura recibida por MQTT desde el Gateway"""
+    return latest_telemetry
 
 @app.post("/api/register", status_code=201)
 def register(user: RegisterRequest):
@@ -223,15 +256,20 @@ def login(credentials: LoginRequest):
 
 @app.post("/api/robot/command")
 def send_command(cmd: CommandRequest):
-    """Recibe comandos desde la UI de Flutter (Joystick) y los manda por MQTT al Gateway"""
+    """Recibe comandos desde Flutter y los publica en el tópico del Gateway"""
     if mqtt_client is None:
         raise HTTPException(status_code=503, detail="Cliente MQTT no inicializado")
 
-    topic = f"robot/{cmd.robot_id}/command"
-    payload = json.dumps({"comando": cmd.comando, "modo": cmd.modo})
+    payload_dict = {
+        "modo": cmd.modo,
+        "comando": cmd.comando,
+    }
+    if cmd.lat is not None and cmd.lng is not None:
+        payload_dict["lat"] = cmd.lat
+        payload_dict["lng"] = cmd.lng
 
     try:
-        mqtt_client.publish(topic, payload)
-        return {"status": "success", "message": f"Comando '{cmd.comando}' enviado al robot {cmd.robot_id}"}
+        mqtt_client.publish(TOPIC_CMD, json.dumps(payload_dict))
+        return {"status": "success", "payload": payload_dict}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error MQTT: {e}")

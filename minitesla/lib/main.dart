@@ -26,7 +26,7 @@ class RobotControlApp extends StatelessWidget {
       title: 'Entorno Inteligente',
       debugShowCheckedModeBanner: false, // Quita la etiqueta roja de "DEBUG"
       theme: AppTheme.dark,
-      initialRoute: '/home',
+      initialRoute: '/login',
       routes: {
         '/login': (context) => const LoginScreen(),
         '/home': (context) => const HomeScreen(),
